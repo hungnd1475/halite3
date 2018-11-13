@@ -98,7 +98,7 @@ impl Game {
         }
     }
 
-    pub fn end_turn(commands: &[Command]) {
+    pub fn end_turn(commands: impl Iterator<Item = Command>) {
         for command in commands {
             print!("{} ", command.0);
         }
