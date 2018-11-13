@@ -107,4 +107,9 @@ impl Navi {
         let y = ((position.y % height) + height) % height;
         Position { x, y }
     }
+
+    pub fn normalized_offset(&self, origin: &Position, direction: Direction) -> Position {
+        let position = origin.directional_offset(direction);
+        self.normalize(&position)
+    }
 }

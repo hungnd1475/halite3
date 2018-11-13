@@ -22,6 +22,10 @@ impl Direction {
         vec![Direction::North, Direction::South, Direction::East, Direction::West]
     }
 
+    pub fn get_all() -> Vec<Direction> {
+        vec![Direction::Still, Direction::North, Direction::South, Direction::East, Direction::West]
+    }
+
     pub fn get_char_encoding(&self) -> char {
         match self {
             Direction::North => 'n',

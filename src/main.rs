@@ -14,7 +14,7 @@ use hlt::ShipId;
 use rand::Rng;
 use rand::SeedableRng;
 use rand::XorShiftRng;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::env;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -22,7 +22,7 @@ use std::time::UNIX_EPOCH;
 mod hlt;
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
-enum ShipState {
+enum ShipAction {
     Collecting,
     Returning,
 }
@@ -71,8 +71,10 @@ fn main() {
         game.my_id.0
     ));
 
-    let mut ship_states: HashMap<ShipId, ShipState> = HashMap::new();
-    let mut occupied_positions: HashSet<Position> = HashSet::with_capacity(400);
+    let mut ship_states: HashMap<ShipId, ShipAction> = HashMap::new();
+    let mut occupied_moves: HashMap<Position, (ShipId, bool)> = HashMap::new();
+    let mut ships_queue: Vec<ShipId> = Vec::new();
+    let mut waiting_ships: HashMap<ShipId, ShipId> = HashMap::new();
 
     loop {
         game.update_frame();
@@ -83,118 +85,253 @@ fn main() {
 
         let mut command_queue: Vec<Command> = Vec::new();
 
-        if game.turn_number == game.constants.max_turns {}
-
         for ship_id in &me.ship_ids {
             let ship = &game.ships[ship_id];
             let max_halite = game.constants.max_halite;
             ship_states
                 .entry(*ship_id)
                 .and_modify(|state| {
-                    if *state == ShipState::Collecting {
+                    if *state == ShipAction::Collecting {
                         if ship.halite >= max_halite * 9 / 10 {
-                            *state = ShipState::Returning;
+                            *state = ShipAction::Returning;
                         }
                     } else if ship.halite == 0 {
-                        *state = ShipState::Collecting;
+                        *state = ShipAction::Collecting;
                     }
-                }).or_insert(ShipState::Collecting);
-            occupied_positions.insert(ship.position);
+                }).or_insert(ShipAction::Collecting);
+            occupied_moves.insert(ship.position, (*ship_id, false));
         }
 
-        for ship_id in &me.ship_ids {
-            let ship = &game.ships[ship_id];
-            let state = ship_states.get(ship_id).unwrap();
-            match *state {
-                ShipState::Collecting => {
-                    let direction = get_best_move(ship, map, &occupied_positions, &navi).unwrap_or(
+        ships_queue.extend(&me.ship_ids);
+        while let Some(ship_id) = ships_queue.pop() {
+            let ship = &game.ships[&ship_id];
+            let state = ship_states[&ship_id];
+            Log::log(&format!(
+                "Moving ship {} at {} for {:?}",
+                ship_id.0, ship.position, state
+            ));
+            let result = match state {
+                ShipAction::Collecting => {
+                    get_best_move(ship, map, &navi, &occupied_moves, &waiting_ships).unwrap_or(
                         get_random_move(
                             ship,
-                            &occupied_positions,
                             &mut rng,
                             &navi,
                             &me.shipyard.position,
+                            &occupied_moves,
+                            &waiting_ships,
                         ),
-                    );
-                    if direction != Direction::Still {
-                        let position = ship.position.directional_offset(direction);
-                        let position = navi.normalize(&position);
-                        occupied_positions.insert(position);
-                        occupied_positions.remove(&ship.position);
+                    )
+                }
+                ShipAction::Returning => get_return_move(
+                    ship,
+                    &navi,
+                    &me.shipyard.position,
+                    &occupied_moves,
+                    &waiting_ships,
+                ),
+            };
+            match result {
+                MoveResult::Waiting(blocking_ship) => {
+                    Log::log(&format!("Waiting for ship {} to resolve", blocking_ship.0));
+                    waiting_ships.insert(blocking_ship, ship_id);
+                }
+                MoveResult::Resolved(direction) => {
+                    let position = navi.normalized_offset(&ship.position, direction);
+                    Log::log(&format!("Resolved at {:?} -> {}", direction, position));
+
+                    let &(occupied_ship, _) = occupied_moves.get(&ship.position).unwrap();
+                    if occupied_ship == ship_id {
+                        occupied_moves.remove(&ship.position);
+                    }
+                    occupied_moves.insert(position, (ship_id, true));
+                    if let Some(waiting_ship) = waiting_ships.remove(&ship_id) {
+                        ships_queue.push(waiting_ship);
+                        Log::log(&format!(
+                            "Push waiting ship {} back to resolve",
+                            waiting_ship.0
+                        ));
                     }
                     command_queue.push(ship.move_ship(direction));
-                }
-                ShipState::Returning => {
-                    let direction = navi.naive_navigate(ship, &me.shipyard.position);
-                    let position = ship.position.directional_offset(direction);
-                    if occupied_positions.contains(&position) {
-                        command_queue.push(ship.stay_still());
-                    } else {
-                        command_queue.push(ship.move_ship(direction));
-                        occupied_positions.insert(position);
-                        occupied_positions.remove(&ship.position);
-                    }
                 }
             }
         }
 
         if game.turn_number <= 200
             && me.halite >= game.constants.ship_cost
-            && navi.is_safe(&me.shipyard.position)
+            && !occupied_moves.contains_key(&me.shipyard.position)
         {
             command_queue.push(me.shipyard.spawn());
         }
 
-        occupied_positions.drain();
+        occupied_moves.drain();
+        Log::log(&format!("{} ships waiting", waiting_ships.len()));
+        waiting_ships.drain();
         Game::end_turn(&command_queue);
+    }
+}
+
+enum MoveResult {
+    Resolved(Direction),
+    Waiting(ShipId),
+}
+
+impl MoveResult {
+    fn determine(
+        ship: &Ship,
+        direction: Direction,
+        blocking_ship: &Option<ShipId>,
+        waiting_ships: &HashMap<ShipId, ShipId>,
+    ) -> Self {
+        if direction == Direction::Still {
+            MoveResult::Resolved(direction)
+        } else {
+            if let Some(blocking_ship) = *blocking_ship {
+                if waiting_ships
+                    .get(&ship.id)
+                    .map(|&ws| ws != blocking_ship)
+                    .unwrap_or(true)
+                {
+                    MoveResult::Waiting(blocking_ship)
+                } else {
+                    MoveResult::Resolved(direction)
+                }
+            } else {
+                MoveResult::Resolved(direction)
+            }
+        }
     }
 }
 
 fn get_random_move(
     ship: &Ship,
-    occupied_positions: &HashSet<Position>,
     rng: &mut XorShiftRng,
     navi: &Navi,
     shipyard_position: &Position,
-) -> Direction {
-    let mut possible_directions = Direction::get_all_cardinals();
-    while possible_directions.len() > 0 {
-        let index = rng.gen_range(0, possible_directions.len());
-        let direction = possible_directions[index];
-        let position = ship.position.directional_offset(direction);
-        let position = navi.normalize(&position);
-        if !occupied_positions.contains(&position) && position != *shipyard_position {
-            return direction;
+    occupied_moves: &HashMap<Position, (ShipId, bool)>,
+    waiting_ships: &HashMap<ShipId, ShipId>,
+) -> MoveResult {
+    let mut safe_moves = get_safe_moves(
+        &Direction::get_all_cardinals(),
+        ship,
+        navi,
+        occupied_moves,
+        waiting_ships,
+    );
+    while !safe_moves.is_empty() {
+        let index = rng.gen_range(0, safe_moves.len());
+        let (direction, blocking_ship) = safe_moves[index];
+        let position = navi.normalized_offset(&ship.position, direction);
+        if position != *shipyard_position {
+            return MoveResult::determine(ship, direction, &blocking_ship, waiting_ships);
         } else {
-            possible_directions.remove(index);
+            safe_moves.remove(index);
         }
     }
-    Direction::Still
+    MoveResult::Resolved(Direction::Still)
 }
 
 fn get_best_move(
     ship: &Ship,
     map: &GameMap,
-    occupied_positions: &HashSet<Position>,
     navi: &Navi,
-) -> Option<Direction> {
-    let cell = map.at_entity(ship);
+    occupied_moves: &HashMap<Position, (ShipId, bool)>,
+    waiting_ships: &HashMap<ShipId, ShipId>,
+) -> Option<MoveResult> {
+    let ship_cell = map.at_entity(ship);
+    if ship.halite < ship_cell.halite * 10 / 100 {
+        return Some(MoveResult::Resolved(Direction::Still));
+    }
+
+    let safe_moves = get_safe_moves(
+        &Direction::get_all(),
+        ship,
+        navi,
+        occupied_moves,
+        waiting_ships,
+    );
     let mut best_direction = Direction::Still;
-    let mut best_halite = cell.halite * 3;
-    let mut all_zeroes = best_halite == 0;
-    for next_dir in Direction::get_all_cardinals() {
-        let next_position = ship.position.directional_offset(next_dir);
-        let next_position = navi.normalize(&next_position);
-        let next_cell = map.at_position(&next_position);
-        all_zeroes = all_zeroes && next_cell.halite == 0;
-        if !occupied_positions.contains(&next_position) && best_halite <= next_cell.halite {
-            best_direction = next_dir;
-            best_halite = next_cell.halite;
+    let mut best_halite = 0;
+    let mut blocking_ship: Option<ShipId> = None;
+    let mut all_zeroes = true;
+    for (direction, bs) in safe_moves {
+        let position = navi.normalized_offset(&ship.position, direction);
+        let halite = {
+            let halite = map.at_position(&position).halite;
+            if direction == Direction::Still {
+                halite * 3
+            } else {
+                halite
+            }
+        };
+        all_zeroes = all_zeroes && halite == 0;
+        if best_halite <= halite {
+            best_halite = halite;
+            best_direction = direction;
+            blocking_ship = bs;
         }
     }
     if all_zeroes {
         None
     } else {
-        Some(best_direction)
+        Some(MoveResult::determine(
+            ship,
+            best_direction,
+            &blocking_ship,
+            waiting_ships,
+        ))
     }
+}
+
+fn get_return_move(
+    ship: &Ship,
+    navi: &Navi,
+    shipyard_position: &Position,
+    occupied_moves: &HashMap<Position, (ShipId, bool)>,
+    waiting_ships: &HashMap<ShipId, ShipId>,
+) -> MoveResult {
+    let safe_moves = get_safe_moves(
+        &navi.get_unsafe_moves(&ship.position, shipyard_position),
+        ship,
+        navi,
+        occupied_moves,
+        waiting_ships,
+    );
+    let mut result: Option<MoveResult> = None;
+    for (direction, blocking_ship) in safe_moves {
+        let r = MoveResult::determine(ship, direction, &blocking_ship, waiting_ships);
+        match r {
+            MoveResult::Resolved(_) => return r,
+            MoveResult::Waiting(_) => {
+                if result.is_none() {
+                    result = Some(r)
+                }
+            }
+        }
+    }
+    result.unwrap_or(MoveResult::Resolved(Direction::Still))
+}
+
+fn get_safe_moves(
+    directions: &[Direction],
+    ship: &Ship,
+    navi: &Navi,
+    occupied_moves: &HashMap<Position, (ShipId, bool)>,
+    waiting_ships: &HashMap<ShipId, ShipId>,
+) -> Vec<(Direction, Option<ShipId>)> {
+    directions
+        .iter()
+        .filter(|&&direction| {
+            let position = navi.normalized_offset(&ship.position, direction);
+            occupied_moves
+                .get(&position)
+                .map(|&(ship_id, resolved)| !resolved && !waiting_ships.contains_key(&ship_id))
+                .unwrap_or(true)
+        }).map(|&direction| {
+            let position = navi.normalized_offset(&ship.position, direction);
+            (
+                direction,
+                occupied_moves.get(&position).map(|&(ship_id, _)| ship_id),
+            )
+        }).collect()
 }

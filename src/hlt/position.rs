@@ -1,6 +1,7 @@
 use hlt::direction::Direction;
+use std::fmt;
 
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Position {
     pub x: i32,
     pub y: i32,
@@ -24,5 +25,11 @@ impl Position {
             self.directional_offset(Direction::North), self.directional_offset(Direction::South),
             self.directional_offset(Direction::East), self.directional_offset(Direction::West)
         }
+    }
+}
+
+impl fmt::Display for Position {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "({}, {})", self.x, self.y)
     }
 }
