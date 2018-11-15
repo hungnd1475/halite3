@@ -199,6 +199,11 @@ fn main() {
             }
         }
 
+        for (_, ship_id) in waiting_ships.drain() {
+            let ship = &game.ships[&ship_id];
+            command_queue.push(ship.stay_still());
+        }
+
         if game.turn_number <= 200
             && me.halite >= game.constants.ship_cost
             && !occupied_moves.contains_key(&me.shipyard.position)
@@ -207,7 +212,6 @@ fn main() {
         }
 
         occupied_moves.drain();
-        waiting_ships.drain();
         Game::end_turn(command_queue.drain(..));
     }
 }
