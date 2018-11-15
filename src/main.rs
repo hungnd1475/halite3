@@ -28,6 +28,11 @@ enum ShipAction {
     Finishing,
 }
 
+enum Occupation {
+    Me(ShipId, bool),
+    Opponent,
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     let rng_seed: u64 = if args.len() > 1 {
@@ -61,7 +66,7 @@ fn main() {
     ]);
 
     let mut game = Game::new();
-    let mut navi = Navi::new(game.map.width, game.map.height);
+    let navi = Navi::new(game.map.width, game.map.height);
     // At this point "game" variable is populated with initial map data.
     // This is a good place to do computationally expensive start-up pre-processing.
     // As soon as you call "ready" function below, the 2 second per turn timer will start.
@@ -73,15 +78,21 @@ fn main() {
     ));
 
     let mut ship_actions: HashMap<ShipId, ShipAction> = HashMap::new();
-    let mut occupied_moves: HashMap<Position, (ShipId, bool)> = HashMap::new();
+    let mut occupied_moves: HashMap<Position, Occupation> = HashMap::new();
     let mut ships_queue: Vec<ShipId> = Vec::new();
     let mut waiting_ships: HashMap<ShipId, ShipId> = HashMap::new();
     let mut finishing = false;
     let mut command_queue: Vec<Command> = Vec::new();
+    let shipyards_vicinity = {
+        let me = &game.players[game.my_id.0];
+        let mut v = me.shipyard.position.get_surrounding_cardinals();
+        v.push(me.shipyard.position);
+        v
+    };
 
     loop {
         game.update_frame();
-        navi.update_frame(&game);
+        //navi.update_frame(&game);
 
         let me = &game.players[game.my_id.0];
         let remaining_turns = game.constants.max_turns - game.turn_number;
@@ -93,6 +104,19 @@ fn main() {
                 &game.map,
             );
             finishing = max_distance >= remaining_turns;
+        }
+
+        for player in &game.players {
+            for ship_id in &player.ship_ids {
+                let ship = &game.ships[ship_id];
+                if player.id == game.my_id {
+                    occupied_moves.insert(ship.position, Occupation::Me(ship.id, false));
+                } else {
+                    if !shipyards_vicinity.contains(&ship.position) {
+                        occupied_moves.insert(ship.position, Occupation::Opponent);
+                    }
+                }
+            }
         }
 
         for ship_id in &me.ship_ids {
@@ -113,7 +137,6 @@ fn main() {
                         }
                     }
                 }).or_insert(ShipAction::Collecting);
-            occupied_moves.insert(ship.position, (*ship_id, false));
         }
 
         ships_queue.extend(&me.ship_ids);
@@ -154,11 +177,16 @@ fn main() {
                     let position = navi.normalized_offset(&ship.position, direction);
                     Log::log(&format!("Resolved at {:?} -> {}", direction, position));
 
-                    let &(occupied_ship, _) = occupied_moves.get(&ship.position).unwrap();
-                    if occupied_ship == ship_id {
+                    if occupied_moves
+                        .get(&ship.position)
+                        .map(|occupation| match *occupation {
+                            Occupation::Me(occupied_ship, _) => occupied_ship == ship_id,
+                            Occupation::Opponent => unreachable!(),
+                        }).unwrap()
+                    {
                         occupied_moves.remove(&ship.position);
                     }
-                    occupied_moves.insert(position, (ship_id, true));
+                    occupied_moves.insert(position, Occupation::Me(ship_id, true));
                     if let Some(waiting_ship) = waiting_ships.remove(&ship_id) {
                         ships_queue.push(waiting_ship);
                         Log::log(&format!(
@@ -179,6 +207,7 @@ fn main() {
         }
 
         occupied_moves.drain();
+        waiting_ships.drain();
         Game::end_turn(command_queue.drain(..));
     }
 }
@@ -235,7 +264,7 @@ fn get_random_move(
     rng: &mut XorShiftRng,
     navi: &Navi,
     shipyard_position: &Position,
-    occupied_moves: &HashMap<Position, (ShipId, bool)>,
+    occupied_moves: &HashMap<Position, Occupation>,
     waiting_ships: &HashMap<ShipId, ShipId>,
 ) -> MoveResult {
     let mut safe_moves = get_safe_moves(
@@ -262,7 +291,7 @@ fn get_best_move(
     ship: &Ship,
     map: &GameMap,
     navi: &Navi,
-    occupied_moves: &HashMap<Position, (ShipId, bool)>,
+    occupied_moves: &HashMap<Position, Occupation>,
     waiting_ships: &HashMap<ShipId, ShipId>,
 ) -> Option<MoveResult> {
     let ship_cell = map.at_entity(ship);
@@ -314,7 +343,7 @@ fn get_return_move(
     ship: &Ship,
     navi: &Navi,
     shipyard_position: &Position,
-    occupied_moves: &HashMap<Position, (ShipId, bool)>,
+    occupied_moves: &HashMap<Position, Occupation>,
     waiting_ships: &HashMap<ShipId, ShipId>,
     finishing: bool,
 ) -> MoveResult {
@@ -347,7 +376,7 @@ fn get_safe_moves(
     directions: &[Direction],
     ship: &Ship,
     navi: &Navi,
-    occupied_moves: &HashMap<Position, (ShipId, bool)>,
+    occupied_moves: &HashMap<Position, Occupation>,
     waiting_ships: &HashMap<ShipId, ShipId>,
 ) -> Vec<(Direction, Option<ShipId>)> {
     directions
@@ -356,13 +385,22 @@ fn get_safe_moves(
             let position = navi.normalized_offset(&ship.position, direction);
             occupied_moves
                 .get(&position)
-                .map(|&(ship_id, resolved)| !resolved && !waiting_ships.contains_key(&ship_id))
-                .unwrap_or(true)
+                .map(|occupation| match *occupation {
+                    Occupation::Me(ship_id, resolved) => {
+                        !resolved && !waiting_ships.contains_key(&ship_id)
+                    }
+                    Occupation::Opponent => false,
+                }).unwrap_or(true)
         }).map(|&direction| {
             let position = navi.normalized_offset(&ship.position, direction);
             (
                 direction,
-                occupied_moves.get(&position).map(|&(ship_id, _)| ship_id),
+                occupied_moves
+                    .get(&position)
+                    .and_then(|occupation| match *occupation {
+                        Occupation::Me(ship_id, _) => Some(ship_id),
+                        Occupation::Opponent => unreachable!(),
+                    }),
             )
         }).collect()
 }
