@@ -18,6 +18,14 @@ impl Direction {
         }
     }
 
+    pub fn get_orthorgonal(&self) -> Vec<Direction> {
+        match self {
+            Direction::North | Direction::South => vec![Direction::East, Direction::West],
+            Direction::East | Direction::West => vec![Direction::North, Direction::South],
+            Direction::Still => vec![Direction::Still]
+        }
+    }
+
     pub fn get_all_cardinals() -> Vec<Direction> {
         vec![Direction::North, Direction::South, Direction::East, Direction::West]
     }
