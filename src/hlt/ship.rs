@@ -208,9 +208,8 @@ impl Ship {
     }
 
     fn get_safe_moves(&self, directions: &[Direction], navi: &Navi) -> Vec<SafeMove> {
-        fn check_for_threats(direction: Direction, position: &Position, navi: &Navi) -> i32 {
-            let mut lookup_directions = direction.get_orthorgonal();
-            lookup_directions.push(direction);
+        fn check_for_threats(position: &Position, navi: &Navi) -> i32 {
+            let lookup_directions = Direction::get_all_cardinals();
             let lookup_positions = lookup_directions
                 .iter()
                 .map(|&d| position.directional_offset(d));
@@ -243,7 +242,7 @@ impl Ship {
             }).map(|&direction| {
                 let position = self.position.directional_offset(direction);
                 let blocking_ship = navi.occupation_at(&position).map(|occupation| *occupation);
-                let threat_level = check_for_threats(direction, &position, navi);
+                let threat_level = check_for_threats(&position, navi);
                 SafeMove {
                     direction,
                     blocking_ship,
