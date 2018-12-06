@@ -1,10 +1,11 @@
 use hlt::direction::Direction;
 use hlt::game::Game;
 use hlt::position::Position;
+use hlt::ship::Ship;
 use hlt::ShipId;
 use std::collections::HashMap;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 pub enum Occupation {
     Me(ShipId, bool),
     Enemy(ShipId),
@@ -48,10 +49,34 @@ impl Navi {
         self.waiting.drain();
     }
 
+    pub fn is_empty(&self, position: &Position) -> bool {
+        self.occupation_at(&position).is_none()
+    }
+
+    pub fn is_hostile(&self, position: &Position) -> bool {
+        self.occupation_at(&position)
+            .map(|occupation| match occupation {
+                Occupation::Me(_, _) => false,
+                Occupation::Enemy(_) => true,
+            }).unwrap_or(false)
+    }
+
+    pub fn friend_at(&self, position: &Position) -> Option<ShipId> {
+        self.occupation_at(position)
+            .map(|occupation| match occupation {
+                Occupation::Me(ship_id, _) => Some(*ship_id),
+                _ => None,
+            }).unwrap_or(None)
+    }
+
     pub fn is_safe(&self, position: &Position) -> bool {
-        let position = self.normalize(position);
-        let occupation = self.occupation_at(&position);
-        occupation.is_none()
+        self.occupation_at(&position)
+            .map(|occupation| match *occupation {
+                Occupation::Me(ship_id, is_final) => {
+                    !is_final && !self.has_ship_waiting_for(&ship_id)
+                }
+                Occupation::Enemy(_) => true,
+            }).unwrap_or(true)
     }
 
     pub fn occupation_at(&self, position: &Position) -> Option<&Occupation> {
@@ -59,11 +84,20 @@ impl Navi {
         self.occupied.get(&position)
     }
 
-    pub fn resolve(&mut self, position: &Position, ship_id: ShipId) {
-        self.mark_unsafe(position, Occupation::Me(ship_id, true));
+    pub fn resolve(&mut self, ship: &Ship, new_position: &Position) {
+        if self
+            .occupation_at(&ship.position)
+            .map(|occupation| match *occupation {
+                Occupation::Me(occupied_ship, _) => occupied_ship == ship.id,
+                Occupation::Enemy(_) => false,
+            }).unwrap_or(false)
+        {
+            self.mark_safe(&ship.position);
+        }
+        self.mark_unsafe(new_position, Occupation::Me(ship.id, true));
     }
 
-    pub fn mark_safe(&mut self, position: &Position) {
+    fn mark_safe(&mut self, position: &Position) {
         let position = self.normalize(position);
         self.occupied.remove(&position);
     }
@@ -74,6 +108,10 @@ impl Navi {
 
     pub fn has_ship_waiting_for(&self, blocking_ship: &ShipId) -> bool {
         self.waiting.contains_key(blocking_ship)
+    }
+
+    pub fn waiting_ship(&self, blocking_ship: &ShipId) -> Option<&ShipId> {
+        self.waiting.get(blocking_ship)
     }
 
     pub fn get_unsafe_moves(&self, source: &Position, destination: &Position) -> Vec<Direction> {

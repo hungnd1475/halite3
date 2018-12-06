@@ -1,10 +1,10 @@
 use hlt::command::Command;
 use hlt::direction::Direction;
 use hlt::entity::Entity;
+use hlt::game::Game;
 use hlt::game_map::GameMap;
 use hlt::input::Input;
 use hlt::log::Log;
-use hlt::map_cell::{MapCell, Structure};
 use hlt::navi::{Navi, Occupation};
 use hlt::player::Player;
 use hlt::position::Position;
@@ -22,6 +22,10 @@ pub struct Ship {
 impl Ship {
     pub fn is_full(&self) -> bool {
         self.halite >= self.max_halite
+    }
+
+    pub fn is_full_by(&self, percentage: usize) -> bool {
+        self.halite >= self.max_halite * percentage / 100
     }
 
     pub fn make_dropoff(&self) -> Command {
@@ -56,7 +60,7 @@ impl Ship {
         &self,
         radius: i32,
         map: &GameMap,
-        navi: &Navi,
+        _navi: &Navi,
         goal: Option<&Position>,
     ) -> Position {
         let (mut goal, mut goal_halite) = goal
@@ -84,13 +88,28 @@ impl Ship {
         player: &Player,
         map: &GameMap,
         navi: &Navi,
+        dropoffs: &[Position],
         finishing: bool,
     ) -> MoveDecision {
-        let unsafe_moves = navi.get_unsafe_moves(&self.position, &player.shipyard.position);
+        let nearest_dropoff = dropoffs.iter().fold(&player.shipyard.position, |a, b| {
+            let ad = map.calculate_distance(a, &self.position);
+            let bd = map.calculate_distance(b, &self.position);
+            if ad > bd {
+                b
+            } else {
+                a
+            }
+        });
+
+        let distance = map.calculate_distance(nearest_dropoff, &self.position);
+        if distance > map.width / 3 && player.halite >= 4000 - self.halite - map.at_entity(self).halite {
+            return MoveDecision::Dropoff;
+        }
+
+        let unsafe_moves = navi.get_unsafe_moves(&self.position, nearest_dropoff);
         if unsafe_moves.len() == 0 {
             MoveDecision::Final(Direction::Still)
-        } else if finishing
-            && self.position.directional_offset(unsafe_moves[0]) == player.shipyard.position
+        } else if finishing && self.position.directional_offset(unsafe_moves[0]) == *nearest_dropoff
         {
             MoveDecision::Final(unsafe_moves[0])
         } else {
@@ -99,11 +118,16 @@ impl Ship {
             safe_moves.sort_by(|a, b| a.threat_level.cmp(&b.threat_level));
 
             for mv in safe_moves {
-                let decision = MoveDecision::decide(self, &mv, navi, false);
-                if let Some(decision) = decision {
-                    return decision;
+                if mv
+                    .blocking_ship
+                    .map(|occupation| match occupation {
+                        Occupation::Enemy(_) => true,
+                        Occupation::Me(_, _) => false,
+                    }).unwrap_or(false)
+                {
+                    enemy_blocked = Some(mv)
                 } else {
-                    enemy_blocked = Some(mv);
+                    return MoveDecision::decide(self, &mv, navi);
                 }
             }
 
@@ -113,9 +137,14 @@ impl Ship {
                 safe_moves.sort_by(|a, b| a.threat_level.cmp(&b.threat_level));
 
                 for mv in safe_moves {
-                    let decision = MoveDecision::decide(self, &mv, navi, false);
-                    if let Some(decision) = decision {
-                        return decision;
+                    if mv
+                        .blocking_ship
+                        .map(|occupation| match occupation {
+                            Occupation::Me(_, _) => true,
+                            Occupation::Enemy(_) => false,
+                        }).unwrap_or(true)
+                    {
+                        return MoveDecision::decide(self, &mv, navi);
                     }
                 }
             }
@@ -127,11 +156,11 @@ impl Ship {
     pub fn collect_halite(
         &self,
         player: &Player,
-        map: &GameMap,
+        game: &Game,
         navi: &Navi,
         goal: &Position,
     ) -> MoveDecision {
-        let ship_cell = map.at_entity(self);
+        let ship_cell = game.map.at_entity(self);
         if (self.halite as f64) < ((ship_cell.halite as f64) * 0.1).round() {
             return MoveDecision::Final(Direction::Still);
         }
@@ -145,8 +174,8 @@ impl Ship {
         };
         Log::log(&format!("Goal moves: {:?}", goal_moves));
 
-        self.get_best_move(&goal_moves, map, navi)
-            .map(|mv| MoveDecision::decide(self, &mv, navi, false).unwrap())
+        self.get_best_move(&goal_moves, game, navi)
+            .map(|mv| MoveDecision::decide(self, &mv, navi))
             .unwrap_or_else(|| {
                 let other_moves: Vec<Direction> = Direction::get_all()
                     .into_iter()
@@ -154,25 +183,25 @@ impl Ship {
                     .collect();
                 Log::log(&format!("Other moves: {:?}", other_moves));
 
-                self.get_best_move(&other_moves, map, navi)
-                    .map(|mv| MoveDecision::decide(self, &mv, navi, false).unwrap())
+                self.get_best_move(&other_moves, game, navi)
+                    .map(|mv| MoveDecision::decide(self, &mv, navi))
                     .unwrap_or(MoveDecision::Final(Direction::Still))
             })
     }
 
-    fn get_best_move(
+    fn get_best_move<'a>(
         &self,
         directions: &[Direction],
-        map: &GameMap,
-        navi: &Navi,
-    ) -> Option<SafeMove> {
+        game: &Game,
+        navi: &'a Navi,
+    ) -> Option<SafeMove<'a>> {
         let safe_moves = self.get_safe_moves(&directions, navi);
         let mut best_move = None;
         let mut best_halite = 0;
 
         for mv in safe_moves {
             let position = self.position.directional_offset(mv.direction);
-            let mut halite = map.at_position(&position).halite;
+            let mut halite = game.map.at_position(&position).halite;
             if halite >= 20 && mv.direction == Direction::Still {
                 halite *= 3;
             } else if halite < 20 && mv.direction == Direction::Still {
@@ -207,7 +236,7 @@ impl Ship {
         best_move
     }
 
-    fn get_safe_moves(&self, directions: &[Direction], navi: &Navi) -> Vec<SafeMove> {
+    fn get_safe_moves<'a>(&self, directions: &[Direction], navi: &'a Navi) -> Vec<SafeMove<'a>> {
         fn check_for_threats(position: &Position, navi: &Navi) -> i32 {
             let lookup_directions = Direction::get_all_cardinals();
             let lookup_positions = lookup_directions
@@ -232,16 +261,10 @@ impl Ship {
             .iter()
             .filter(|&&direction| {
                 let position = self.position.directional_offset(direction);
-                navi.occupation_at(&position)
-                    .map(|occupation| match *occupation {
-                        Occupation::Me(ship_id, is_final) => {
-                            !is_final && !navi.has_ship_waiting_for(&ship_id)
-                        }
-                        Occupation::Enemy(_) => true,
-                    }).unwrap_or(true)
+                navi.is_safe(&position)
             }).map(|&direction| {
                 let position = self.position.directional_offset(direction);
-                let blocking_ship = navi.occupation_at(&position).map(|occupation| *occupation);
+                let blocking_ship = navi.occupation_at(&position);
                 let threat_level = check_for_threats(&position, navi);
                 SafeMove {
                     direction,
@@ -252,30 +275,23 @@ impl Ship {
     }
 }
 
-// pub struct Vicinity {
-//     pub richest_cells: Vec<MapCell>,
-//     pub goal: Position,
-//     pub goal_moves: Vec<Direction>,
-//     pub other_moves: Vec<Direction>,
-//     //enemies: Vec<Position>,
-// }
-
-#[derive(Debug, Copy, Clone)]
-struct SafeMove {
+#[derive(Debug)]
+struct SafeMove<'a> {
     direction: Direction,
-    blocking_ship: Option<Occupation>,
+    blocking_ship: Option<&'a Occupation>,
     threat_level: i32,
 }
 
 pub enum MoveDecision {
     Waiting(Direction, ShipId),
     Final(Direction),
+    Dropoff,
 }
 
 impl MoveDecision {
-    fn decide(ship: &Ship, mv: &SafeMove, navi: &Navi, offensive: bool) -> Option<Self> {
+    fn decide(ship: &Ship, mv: &SafeMove, navi: &Navi) -> Self {
         if mv.direction == Direction::Still {
-            Some(MoveDecision::Final(mv.direction))
+            MoveDecision::Final(mv.direction)
         } else {
             if let Some(blocking_ship) = mv.blocking_ship {
                 match blocking_ship {
@@ -283,22 +299,18 @@ impl MoveDecision {
                         if navi
                             .waiting
                             .get(&ship.id)
-                            .map(|&ws| ws != bs)
+                            .map(|&ws| ws != *bs)
                             .unwrap_or(true)
                         {
-                            Some(MoveDecision::Waiting(mv.direction, bs))
+                            MoveDecision::Waiting(mv.direction, *bs)
                         } else {
-                            Some(MoveDecision::Final(mv.direction))
+                            MoveDecision::Final(mv.direction)
                         }
                     }
-                    Occupation::Enemy(_) => if offensive {
-                        Some(MoveDecision::Final(mv.direction))
-                    } else {
-                        None
-                    },
+                    Occupation::Enemy(_) => MoveDecision::Final(mv.direction),
                 }
             } else {
-                Some(MoveDecision::Final(mv.direction))
+                MoveDecision::Final(mv.direction)
             }
         }
     }
